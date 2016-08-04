@@ -1,0 +1,535 @@
+---
+title: "Cord blood - Re-analysis"
+output:
+  html_document:
+    theme: united
+    toc: yes
+    toc_depth: 5
+  pdf_document:
+    toc: yes
+bibliography: references.bib
+---
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitcitations)
+cleanbib()
+options("citation_format" = "pandoc")
+
+clientname="Mauricio Cortes"
+clientemail="mcortes1@bidmc.harvard.edu"
+labPI="Trista North"
+lablocation="BIDMC"
+analystname="Meeta Mistry"
+analystemail="mmistry@hsph.harvard.edu"
+
+
+library(knitr)
+opts_chunk$set(warning=FALSE, error=FALSE, message=FALSE, echo=FALSE,cache=FALSE, tidy.opts=list(keep.blank.line=FALSE, width.cutoff=120), dev="svg")
+options(width=200)
+```
+
+---
+
+Array analysis for `r clientname` (`r clientemail`), `r labPI` group at `r lablocation`.  
+
+Contact `r analystname` (`r analystemail`) for additional details.
+
+The most recent update of this html document occurred: `r date()`
+
+The sections below provide code to reproduce the included results and plots. 
+
+---
+
+
+# Methods Summary  
+
+**This analysis was re-run to assess results after a potential sample swap between 444.s.DMSO and 444.s125D3.**
+
+All Affymetrix HTA 2.0 arrays were processed using the 'oligo' BioConductor package `r citep("10.1093/bioinformatics/btq431")`, quality-controlled with arrayQualityMetrics `r citep("10.1093/bioinformatics/btn647")` and normalized with RMA `r citep("10.1093/biostatistics/4.2.249")`. Differentially expressed genes were identified using limma `r citep("http://link.springer.com/chapter/10.1007%2F0-387-29362-0_23")`.
+
+---
+
+# Setup
+
+## Variables
+Working directories, files and other variables necessary to the analysis.
+
+```{r variables}
+## Setup Data and Results directory variables
+baseDir <- getwd()
+dataDir <- file.path(baseDir, "data")
+metaDir <- file.path(baseDir, "meta")
+resultsDir <- file.path(baseDir, "results_new")
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7") # colorblind friendly palette
+covarsfilename="covars.revised.desc" # tab delimited file describing samples
+lowintensity.percentile=0.1
+mad.quantile.cutoff=0.1
+pvalue.cutoff=0.05
+highlight.color="green"
+lfc.cutoff=1
+```
+
+## Libraries
+
+[Bioconductor](http://www.bioconductor.org) and [R](http://cran.r-project.org/) libraries used to process and visualize the data.
+
+```{r libraries_variables, echo=TRUE}
+library(knitr) # for simple tables
+library(oligo) # array utilities
+library(pd.hta.2.0) # array layout annotation
+library(arrayQualityMetrics) # array quality control reports
+library(limma) # array statistical analyses
+library(devtools) # install libraries from github
+# install_git("git://github.com/hbc/CHBUtils.git") # misc personal utilities
+library(CHBUtils) # some homegrown functions
+library(reshape2) # data format utility
+library(ggplot2) # pretty graphs
+library(ggdendro) # for pretty dendrograms
+library(RColorBrewer) # more colors
+library(gridExtra) # for arranging multiple plots
+library(pheatmap) # pretty heatmaps
+library(plyr) # data format utility
+library(corrgram)
+library(pvca)
+library(dplyr) # data format utility 
+# library(hta20transcriptcluster.db) #Annotation package for HTA 2.0
+library(hta20sttranscriptcluster.db) #new package for annotation
+library(sva) # Surrogate Variable Analysis (includes ComBat)
+
+```
+
+
+## Functions
+
+```{r functions, echo=FALSE}
+# for plotting amount of variation explained by principal components
+PCAplot.sd.eset <- function(eset=NULL,  title=NULL){
+  eset.core <- exprs(eset)
+  myPca.core <- prcomp(t(eset.core))
+  # SD of components
+  sdevdf <- data.frame(cbind(as.numeric(myPca.core$sdev),c(1:length(myPca.core$sdev))))
+  sdevdf$prop <-  sdevdf$X1/sum(sdevdf$X1)
+  sdevdf$cum <- cumsum(sdevdf$prop)
+  ggplot(sdevdf, aes(x=X2, y=prop)) + 
+    geom_point(size=4, color="red") + 
+    scale_x_continuous('Component') + 
+    scale_y_continuous('Standard Deviation') +
+    ggtitle(title) +
+    geom_line(data=sdevdf, aes(x=X2, y=cum))
+}
+
+# used for formatting labels on ggplots
+fmt <- function(){ 
+  function(x) format(x,nsmall = 1,scientific = FALSE)
+}
+
+
+plot_dendro <- function(x, title="", labels.colname=NULL, colors.colname=NULL) {
+  require(ggdendro)
+  meta.x <- pData(x)
+  # force the metadata into character format so you don't end up with gradient/continuous color schemes for numerical variables in the final plot  
+  meta.x <- as.matrix(meta.x) 
+  ## do the actual statistics and put into dendrogram 
+  myDist <- dist(t(exprs(x)))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  # the labels of the dendrogram are pulled from the Expression set exprs column names, it's nice to rename them to something more intelligible if you haven't already, as well as match them up to the metadata for label coloring
+  ## check to see if the column names of the expression set match anything in the metadata, or match the rownames
+  if (identical(colnames(exprs(x)), row.names(meta.x))) {
+    meta.x <- row2colnames(meta.x, "rownames")
+    matchcol <- "rownames"
+  } else if (any(apply(meta.x, 2, function(column) identical(as.character(unlist(column)), colnames(exprs(x)))))) {
+    matchcol <- names(which(apply(meta.x, 2, function(column) identical(as.character(unlist(column)), colnames(exprs(x))))))
+  } else {
+    print("ExpressionSet sampleNames and pData row.names or pData column must match")
+    stop()
+  }
+  ## merge the metadata with the dendrogram labels using the commmon column/rownames you just identified above
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y=matchcol)
+  # plot it like you mean it
+  ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes_string(x='x', y='y', label=labels.colname, color=colors.colname, hjust=-0.1), size=4)+
+    scale_color_brewer(type = "seq", palette = "Set1")+
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank()) +
+    ggtitle(title)
+}
+```
+
+---
+
+# Import Data and Metadata
+
+## Data
+- load in phenotypes and array names from metadata file (covars.desc) in "metadata" directory
+  - this file contains the names and descriptions of CEL files contained in the data directory 
+- use array names to load in arrays 
+
+```{r dataload, results='hide'}
+covars <- read.table(file.path(metaDir, covarsfilename),header=TRUE, sep="\t", row.names=1) # simple tab delimited file with CEL file in first column (no heading for this column) and sample metadata (i.e. sampleID, treatment group, batch etc.) in subsequent columns
+
+#covars<-covars[covars$batch==2,]
+
+celFiles <- file.path(dataDir, row.names(covars))
+affyRaw <- read.celfiles(celFiles)
+pData(affyRaw) <- covars 
+sampleNames(affyRaw) <- pData(affyRaw)$sampleID
+validObject(affyRaw)
+```
+
+## Sample metadata
+
+```{r covars, results='asis', echo=FALSE}
+# Sample information table
+kable(pData(affyRaw))
+```
+
+---
+
+# PreProcessing 
+
+## Raw Data 
+
+### Quality Control
+
+- using arrayQualityMetrics library `r citep("Kauffmann_2008")`
+
+```{r rawQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyRaw, outdir=file.path(resultsDir, 'report_raw_test'), force=TRUE, do.logtransform=TRUE, intgroup=c("sampleID", "treatment", "batch", "blooddonor", "bloodtype"))
+```
+
+[Raw Data QC Report](results_new/report_raw/index.html)
+
+The arrays look fine, but the array with treated blood from mixed donor (882.m.125D3.1) is a potential outlier according to the 'Distances between arrays' method. It will be included for the initial analysis. 
+
+## RMA Normalized Data
+
+- background correct and normalize data with RMA `r citep("10.1093/bioinformatics/19.2.185")`
+
+- summarize probesets on the gene ('core') level
+
+```{r normalize, results='hide'}
+affyNorm.core <- rma(affyRaw, target="core", background=TRUE, normalize=TRUE)
+#affyNorm.probeset <- rma(affyRaw, target="probeset", background=TRUE, normalize=TRUE)
+
+```
+
+### Quality Control
+- using arrayQualityMetrics library
+
+```{r normQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyNorm.core, outdir=file.path(resultsDir, paste("report_rma.core", sep=".")), force=TRUE, do.logtransform=FALSE, intgroup=c("sampleID", "treatment", "batch", "blooddonor", "bloodtype"))
+```
+
+[Normalized Data QC Report](results_new/report_rma.core/index.html)
+
+The normalized data show a weird distribution with high amount of strong signals. The clustering indicates a batch and blood donor effect. 
+
+### Correlations
+
+```{r correlation, fig.cap="Correlations between arrays - all combinations"}
+expression<-exprs(affyNorm.core)
+R = cor(expression)
+corrgram(R, order = NULL, lower.panel = panel.conf, upper.panel = NULL, text.panel = panel.txt, main = "Correlations between arrays")
+```
+
+The correlations looks good. The majority of the genes seems to be stable between the arrays.
+
+### Unsupervised Clustering of RMA Normalized Data
+
+#### Hierarchical Clustering
+The goal of these analyses are to naively evaluate the variability within the raw data and determine whether this variability can predict the different sample groups
+
+The first method produces a dendrogram by performing a hierarchical cluster analysis using a set of dissimilarities for the n objects being clustered
+
+```{r cluster1, out.width='75%'}
+plot_dendro(affyNorm.core, title="", labels.colname="sampleID", colors.colname="batch")
+```
+
+The samples are divided into two clusters corresponding to the two batches.
+
+```{r cluster2, out.width='75%'}
+plot_dendro(affyNorm.core, title="", labels.colname="sampleID", colors.colname="blooddonor")
+```
+
+Samples from same blood source are grouped together.
+
+```{r cluster3, out.width='75%'}
+plot_dendro(affyNorm.core, title="", labels.colname="sampleID", colors.colname="treatment")
+```
+
+Treated samples are not clustered together. They are together with control sample from same batch.
+
+The clustering shows that the major influence in data if the arrays belongs to batch 1 or 2. 
+
+#### Principal Component Analysis (PCA)
+
+This second approach is a dimension reduction and visualization technique that is used to project the multivariate (i.e.multiple genes) data vector of each array into a lower-dimensional plot, such that the spatial arrangement of the points in the plot reflects the overall data (dis)similarity between the arrays. The data is typically reduced to a small number of dimensions (or components) which explain most of the sample variability. This [Youtube slideshow](https://www.youtube.com/watch?v=BfTMmoDFXyE) gives a pretty good basic explanation of what PCA is doing.
+
+```{r PCAsd1, out.width='75%'}
+PCAplot.sd.eset(affyNorm.core, title="")
+```
+
+Here, each point depicts the amount of variation explained by each component and the line shows the cumulative amount. For this data set,  very few dimensions (3) can explain >60% of the variation observed in the samples.
+
+As plots with more than 2 dimensions are difficult to visualize, we typically  split up the dimensions/components and plot them pairwise against each other; the plots here show scatterplots of the arrays along all dual combinations of the first three principal components. In the first plot, each sample group is represented by a separate color and in the second plot each sample is represented by a different color. 
+
+You can use these plots to explore if the arrays cluster, find outliers, and determine whether this is according to an intended experimental factor or according to unintended causes such as batch effects. 
+
+
+**It exist a clear seperation between the two batches, but not due to treatment**. 
+
+```{r pca1, fig.cap="Primary Component Analysis of samples - all combinations of the 4 first primary components", out.width='100%'}
+PCAplot.eset(affyNorm.core, categories="batch", title="", colorpalette=rev(cbPalette), numcomponents=4, alpha=0.75)
+```
+
+
+```{r pca2, fig.cap="Primary Component Analysis of samples - all combinations of the 4 first primary components", out.width='100%'}
+PCAplot.eset(affyNorm.core, categories="blooddonor", title="", colorpalette=cbPalette, numcomponents=4, alpha=0.75)
+```
+
+
+```{r pca3, fig.cap="Primary Component Analysis of samples - all combinations of the 4 first primary components", out.width='100%'}
+PCAplot.eset(affyNorm.core, categories="treatment", title="", colorpalette=cbPalette, numcomponents=4, alpha=0.75)
+```
+
+
+There is  a high degree of clustering by batch. When you plot PC1 against PC2 the samples from batch 1 and 2 are separated in two groups. Plotting PC1 against PC3 groups treated and untreated samples from the same blood donor together. These results shows that influence of treatment a smaller impact variation than biological variation than different blood donor sources. 
+
+There are no clear trends of differences between blood samples from single donors and the mixed donor sample so mixed donor sample could be included initially in the analysis to increase statistical power.
+
+### Supervised analysis of RMA Normalized Data
+#### Estimating non-treatment effects
+The unsupervised cluster indicated influence of non-treatment effects.  Those effects can be assessed by using Principal Variance Component Analysis (PVCA) which is a method that fits a mixed linear model (using sources as random effects including two-way interaction) to principal components (PC). The method is described in chapter 12 of the book "Batch Effects and Noise in Microarray Experiments" `r citep("10.1002/9780470685983").
+
+
+```{r batch_estimate, results='hide', out.width='75%'}
+pct_threshold <- 0.6
+batch.factors <- c("batch", "blooddonor", "bloodtype")
+
+pvcaObj.core <- pvcaBatchAssess (affyNorm.core, batch.factors, pct_threshold)
+```
+
+```{r batch_plot}
+bp <- barplot(pvcaObj.core$dat, xlab = "", ylab = "Weighted average proportion variance", ylim= c(0,1.1),col = c("blue"), las=2, main="Effect estimation after RMA normalization")
+axis(1, at = bp, labels = pvcaObj.core$label, xlab = "Effects", cex.axis = 0.5, las=2)
+values = pvcaObj.core$dat
+new_values = round(values , 3)
+text(bp,pvcaObj.core$dat,labels = new_values, pos=3, cex = 0.8)
+```
+
+Major parts of variation in the data is due to batch effects and the interaction between batch and blood donor.  
+
+
+## Annotate
+
+So far we have only been working with the probesets,without reference to the genes they assay. Here we load in metadata about the probesets on the array (feature data), the gene symbols in particular.
+
+
+```{r features, results='hide'}
+featureData(affyNorm.core) <- getNetAffx(affyNorm.core, "transcript") # this will load the Affymetrix annotation, including the probeID, into the fData
+# get gene symbols and entrezIDs for all probesets
+fData(affyNorm.core)$symbol <- as.character(unlist(mget(featureNames(affyNorm.core), hta20sttranscriptclusterSYMBOL, ifnotfound=NA))) # curated annotations from Bioconductor 
+fData(affyNorm.core)$entrezID <- as.character(unlist(mget(featureNames(affyNorm.core), hta20sttranscriptclusterENTREZID, ifnotfound=NA))) # curated annotations from Bioconductor 
+
+```
+
+
+## Filter Probesets
+Reducing the number of genes assayed reduces the multiple test correction and may allow us to identify more differentially expressed genes.
+
+Starting  with `r nrow(fData(affyNorm.core))` probes remaining we can filter:
+
+### By Annotation
+- remove the control probes and probes without annotated genes
+
+```{r filter1}
+affyNorm.core <- affyNorm.core[which(!is.na(fData(affyNorm.core)$symbol) & fData(affyNorm.core)$category=="main"),]
+```
+
+`r nrow(fData(affyNorm.core))` probes remaining
+
+
+### By Low Expression Level
+- remove probes with low expression levels (bottom `r lowintensity.percentile*100`% of all expression levels) in all samples
+
+```{r filter3, cache=TRUE}
+eset.core <- exprs(affyNorm.core)
+affyNorm.core <- affyNorm.core[!(apply(eset.core, 1, function(x) all(x<quantile(exprs(affyNorm.core), 0.1)))),]
+```
+
+`r nrow(fData(affyNorm.core))` probes remaining
+
+### By Low Variability
+- remove probes with lower variation among all samples (without regard for group status) (dropped the bottom `r mad.quantile.cutoff*100`%) 
+
+```{r filter4}
+eset.core <- exprs(affyNorm.core)
+rowmads <- apply(eset.core, 1, mad)
+mad.cutoff <- as.numeric(quantile(rowmads, mad.quantile.cutoff))
+affyNorm.core <- affyNorm.core[rowmads>mad.cutoff,]
+```
+
+`r nrow(fData(affyNorm.core))` probes remaining
+
+## Aggregate probesets
+For any gene that has multiple probe mappings, aggregate expression data by taking a mean across all probes.
+
+```{r aggregate}
+df <- data.frame(exprs(affyNorm.core))
+symbol <- fData(affyNorm.core)$symbol
+df <- cbind(df, symbol)
+
+# Average by Gene Symbol
+genemeans <- aggregate(. ~ symbol, data=df, mean)
+row.names(genemeans) <- genemeans$symbol
+genemeans <- as.matrix(genemeans[,-1])
+colnames(genemeans) <- colnames(exprs(affyNorm.core))
+
+# Create new expression set object 
+affyNorm.gene <- ExpressionSet(genemeans)
+pData(affyNorm.gene) <- pData(affyNorm.core)
+pData(affyNorm.gene)$blooddonor <- factor(pData(affyNorm.gene)$blooddonor)
+                                                               
+```
+
+`r nrow(exprs(affyNorm.gene))` unique genes for differential expression analysis.
+
+---
+
+
+## Statistical analyses
+A linear model for microarray data analysis ([Limma][http://www.bioconductor.org/packages/release/bioc/html/limma.html]) was performed on the samples to identify differentially expressed genes for the comparison of the two treatment groups. Limma fits a linear model to the expression data for all samples for each gene and is designed to handle complex experiments involving comparisons between many RNA targets simultaneously.
+
+### Design matrix 
+To perform limma, we construct a design matrix which provides a representation of the different sample groups which have been analysed. Since we have a single factor and two levels/groups to compare for each blood donor, we can model this with the intercept with the treatment factor using a paired design.
+
+* make a matrix with arrays as rows, sample groups as columns
+* a one or a zero indicate respectively, that a sample either belongs or does not belong to the sample group
+
+```{r}
+# Make design matrix
+pData(affyNorm.core)$blooddonor <- factor(pData(affyNorm.core)$blooddonor)
+design <- model.matrix(~ 0 + treatment + blooddonor,  data=pData(affyNorm.core))
+kable(design)
+```
+
+#### Contrasts
+- to perform specified pairwise comparisons
+- in this table, columns are contrasts/comparisons and rows are sample groups
+-  a zero denotes that the sample group is not involved in the contrast, a 1 denotes that it has higher expression in the contrast and a -1 denotes lower expression in the contrast
+
+Select genes that show a significant expression change between the treated samples.
+
+```{r contrastmatrix, results='asis'}
+contrast.matrix <- makeContrasts(treatment=treatment125D3-treatmentDMSO, levels=colnames(design))
+kable(contrast.matrix)
+```
+
+### Linear model
+
+These matrices are used to fit a linear model to the data. The linear model is applied and pairwise comparisons are performed to identify differentially expressed genes.
+
+- first fit the linear model based on the design matrix for each gene based on the given series of arrays
+- using the contrast matrix, compute estimated coefficients and standard errors for contrasts
+- compute moderated t-statistics and log-odds of differential expression by empirical Bayes shrinkage of the standard errors towards a common value
+
+```{r}
+
+# Fit model
+fit.core <- lmFit(affyNorm.gene, design) 
+
+# Compute cofficients for constrasts
+fit2.core <- contrasts.fit(fit.core, contrast.matrix) 
+
+# Bayes shrinkage
+fit2.core <- eBayes(fit2.core) 
+
+```
+
+
+## Results
+
+**At an FDR < 0.05 there are zero genes differentially expressed betweent treatments. If we relax the threshold to FDR < 0.1 there are still no significant changes**. The p-value histogram illustrates how few genes are identified as significant before any multiple test correction 
+
+```{r, fig.align='center'}
+
+results <- topTable(fit2.core, coef=1, number=nrow(exprs(affyNorm.gene)))
+df <- cbind(results[,c('adj.P.Val','P.Value', 'logFC')])
+ggplot(df) +
+  geom_histogram(aes(x=P.Value)) +
+  theme_bw() +
+  xlab('p-value') 
+
+```
+
+### Volcano plot
+
+If we plot the fold change against the p-values, we find that genes are exhibiting **very small fold changes between treatment groups**. Additionally, the y-axis demonstrates **not very significant p-values** mostly maxing out p=0.001, and this is before multiple test correction.
+
+```{r}
+
+df <- cbind(df, threshold=as.logical(df$adj.P.Val < 0.05)) 
+ggplot(data=df, aes(x=logFC, y=-log10(P.Value), colour=threshold)) +
+  scale_color_manual(values = c("grey", "purple")) +
+  geom_point(alpha=0.75, pch=16, size=2) +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25))) +
+  xlab("log2 fold change") + ylab("-log10 p-value")
+```
+
+
+The **results table for this re-analysis can be downloaded using the links below**. *Note that for the **all probes** files, values are not summarized for genes assayed by multiple probes (i.e. by taking the median value), so you may see multiple instances of the same gene in the results*
+
+```{r write-table, echo=FALSE, eval=FALSE}
+
+#stats <- topTable(fit2.core, coef=1, sort.by="logFC",adjust.method="BH",number=nrow(exprs(affyNorm.core)), 
+#                 genelist=fData(affyNorm.core)[,c("probesetid", "symbol", "entrezID", "mrnaassignment")])
+stats <- topTable(fit2.core, coef=1, sort.by="logFC",adjust.method="BH",number=nrow(exprs(affyNorm.gene)))
+stats$Passes.FDR.threshold  <-  as.factor(stats$adj.P.Val<pvalue.cutoff)
+eset <- exprs(affyNorm.gene)
+eset  <-  eset[match(row.names(stats), row.names(eset)),]
+stats.eset <- cbind(stats, eset)
+
+write.table(stats.eset, file="results_new/uniqueGenes_stats_exprs_Analysis2.xls", sep="\t", quote=F, col.names=NA)
+
+```
+
+* [125D3 treatment results - **unique genes**](results_new/uniqueGenes_stats_exprs_Analysis2.xls)
+* [125D3 treatment results - **all probes**](results_new/allGenes_stats_exprs_Analysis2.xls)
+
+**The summary table above contains the following information:**
+
+- logFC is the log2-fold change
+- the AveExpr is the average expression value accross all arrays
+- the moderated t-statistic (t) is the logFC to its standard error, the P.Value is the associated p-value
+- the adj.P.Value is the p-value adjusted for multiple testing (by FDR) 
+- the B-value (B) is the log-odds that a gene is differentially expressed (the-higher-the-better)
+- the last 8 columns contain the log-transformed normalized expression levels for these genes in each sample
+
+
+---
+
+# R Session Info
+
+(useful if replicating these results)
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+---
+
+# References
+
+```{r writebib, results='hide', echo=FALSE, message=FALSE}
+write.bibtex(file="references.bib")
+```

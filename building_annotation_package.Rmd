@@ -1,0 +1,152 @@
+---
+title: "Building HTA 2.0 annotation package"
+output:
+  html_document:
+    theme: united
+    toc: yes
+    toc_depth: 5
+bibliography: references.bib
+
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+options("citation_format" = "pandoc")
+
+platformid="hta.2.0"
+platformname="GeneChip® Human Transcriptome Array 2.0"
+analystname="Andreas Sjodin"
+analystemail="sjodin@hsph.harvard.edu"
+
+
+library(knitr)
+opts_chunk$set(warning=FALSE, error=FALSE, message=FALSE, echo=FALSE,cache=FALSE, tidy.opts=list(keep.blank.line=FALSE, width.cutoff=120), dev="svg")
+options(width=200)
+```
+
+---
+
+Building annotation package for Affymetrix HTA 2.0 array: (`r platformname`)
+Contact `r analystname` (`r analystemail`) for additional details.
+
+The most recent update of this html document occurred: `r date()`
+
+The sections below provide code to reproduce the building the transcriptcluster (gene) annotation package. 
+
+---
+
+# Setup
+
+## Variables
+Working directories, files and other variables necessary to the analysis.
+
+```{r variables}
+## Setup Data and Results directory variables
+if(file.exists("/n/hsphS10/hsphfs1/chb/projects/mc_cordblood/")){
+  baseDir="/n/hsphS10/hsphfs1/chb/projects/mc_cordblood/"
+    } else if (file.exists("/Users/andreassjodin/hbc-projects/mc_cordblood")){
+    baseDir="/Users/andreassjodin/hbc-projects/mc_cordblood"
+    }
+
+dataDir <- file.path(baseDir, "data")
+metaDir <- file.path(baseDir, "meta")
+resultsDir <- file.path(baseDir, "results")
+
+
+```
+
+## Libraries
+
+[Bioconductor](http://www.bioconductor.org) and [R](http://cran.r-project.org/) libraries used to process build annotation package.
+
+```{r librariesvariables, echo=TRUE}
+library(knitr) # for simple tables
+library(AnnotationForge)
+
+```
+
+## Functions
+
+```{r functions, echo=TRUE}
+parseAffyTranscriptCsv <- function(probefile, orgpkg, fileout, headercol = "mrna_assignment"){ 
+  dat <- read.csv(probefile, comment.char = "#", stringsAsFactors=FALSE,  na.string = "---")
+  mrna <- sapply(strsplit(dat[,headercol], " // | /// "), function(x)  grep("^[NX][MR]|^[A-G][A-Z]+[0-9]+|^[A-Z][0-9]+|^ENST", x, value = TRUE)[1])
+  
+  ens <- grep("^ENS", mrna, value = TRUE)
+  require(orgpkg, character.only = TRUE) || stop(paste("You need to install the", orgpkg, "package first!"))
+  ens <- select(get(orgpkg), ens, c("REFSEQ","ACCNUM"), "ENSEMBLTRANS")
+  ens <- ens[!duplicated(ens[,1]),]
+  
+  ## use accnum if refseq is NA
+  ens[is.na(ens[,2]),2] <- ens[is.na(ens[,2]),3]
+  
+  ## put mapped data back in mrna vector
+  mrna[match(ens[,1], mrna)] <- ens[,2]
+  mrna[grep("^ENS|^GENSCAN", mrna)] <- NA
+  
+  ## write out
+  write.table(cbind(dat[,1], mrna), fileout, sep = "\t", quote = FALSE, row.names = FALSE, col.names  = FALSE, na = "")
+
+}
+```
+
+---
+
+# Building package
+
+
+Set up variables
+```{r annotationvariables, echo=TRUE}
+affytranscriptfile <- "annotation_package/HTA-2_0.na34.hg19.transcript.csv"
+orgdb <- "org.Hs.eg.db"
+mapperfile <- "HTA20_mapper.txt"
+dbschema <- "HUMANCHIP_DB"
+fileprefix <- "hta20transcriptcluster"
+annoversion <- "1.0.0"
+chipname <- "Human Transcriptome Array 2.0"
+```
+
+Create file needed for AnnotationForge (transcript id and Entrez gene)
+
+```{r parsedata, echo=TRUE}
+parseAffyTranscriptCsv(affytranscriptfile, orgdb, mapperfile)
+```
+
+
+Create annotation package
+
+```{r loadid, results='hide', echo=TRUE}
+
+makeDBPackage(
+schema=dbschema,
+affy=FALSE,
+prefix=fileprefix,
+fileName=mapperfile,
+baseMapType="gbNRef",
+outputDir = getwd(),
+version= annoversion,
+manufacturer = "Affymetrix",
+chipName = chipname,
+manufacturerUrl = "http://www.affymetrix.com")
+
+
+```
+
+
+Install created annotation package
+```{r installpackage, echo=TRUE, eval=FALSE}
+install.packages(paste(fileprefix, ".db", sep=""), repos=NULL, type="source")
+
+```
+
+
+
+---
+
+# R Session Info
+
+(useful if replicating these results)
+
+```{r sessioninfo}
+sessionInfo()
+```
+
